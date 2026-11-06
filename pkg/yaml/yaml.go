@@ -3,8 +3,10 @@ package yaml
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -75,24 +77,24 @@ func SetValuesInBytes(inBytes []byte, updates []Update) ([]byte, error) {
 		return nil, fmt.Errorf("error unmarshaling input: %w", err)
 	}
 
-	type change struct {
-		col   int
-		value any
-	}
-	changesByLine := map[int]change{}
+	// Scalars to replace are grouped by the line they begin on, since a line
+	// can hold more than one of them. If a scalar is updated more than once, the
+	// last update wins.
+	valuesByNode := map[*yaml.Node]any{}
+	nodesByLine := map[int][]*yaml.Node{}
 	for _, update := range updates {
 		keyPath, err := sjson.SplitKey(update.Key)
 		if err != nil {
 			return nil, fmt.Errorf("error splitting key %s: %w", update.Key, err)
 		}
-		line, col, err := findScalarNode(doc, keyPath)
+		node, err := findScalarNode(doc, keyPath)
 		if err != nil {
 			return nil, fmt.Errorf("error finding key %s: %w", update.Key, err)
 		}
-		changesByLine[line] = change{
-			col:   col,
-			value: update.Value,
+		if _, found := valuesByNode[node]; !found {
+			nodesByLine[node.Line-1] = append(nodesByLine[node.Line-1], node)
 		}
+		valuesByNode[node] = update.Value
 	}
 
 	outBuf := &bytes.Buffer{}
@@ -107,31 +109,21 @@ func SetValuesInBytes(inBytes []byte, updates []Update) ([]byte, error) {
 	var line int
 	for scanner.Scan() {
 		const errMsg = "error writing to byte buffer"
-		change, found := changesByLine[line]
-		if !found {
-			if _, err := outBuf.WriteString(scanner.Text()); err != nil {
-				return nil, fmt.Errorf("%s: %w", errMsg, err)
-			}
-			if _, err := outBuf.WriteString("\n"); err != nil {
-				return nil, fmt.Errorf("%s: %w", errMsg, err)
-			}
-		} else {
-			unchanged := scanner.Text()[0:change.col]
-			if _, err := outBuf.WriteString(unchanged); err != nil {
-				return nil, fmt.Errorf("%s: %w", errMsg, err)
-			}
-			if !strings.HasSuffix(unchanged, " ") {
-				if _, err := outBuf.WriteString(" "); err != nil {
-					return nil, fmt.Errorf("%s: %w", errMsg, err)
-				}
-			}
-			if _, err := fmt.Fprintf(outBuf,
-				"%v", QuoteIfNecessary(change.value)); err != nil {
-				return nil, fmt.Errorf("%s: %w", errMsg, err)
-			}
-			if _, err := outBuf.WriteString("\n"); err != nil {
-				return nil, fmt.Errorf("%s: %w", errMsg, err)
-			}
+		text := scanner.Text()
+		// Replace scalars from right to left so that each replacement leaves
+		// the positions of the scalars before it unchanged.
+		nodes := nodesByLine[line]
+		slices.SortFunc(nodes, func(a, b *yaml.Node) int {
+			return cmp.Compare(b.Column, a.Column)
+		})
+		for _, node := range nodes {
+			text = replaceScalar(text, node, valuesByNode[node])
+		}
+		if _, err := outBuf.WriteString(text); err != nil {
+			return nil, fmt.Errorf("%s: %w", errMsg, err)
+		}
+		if _, err := outBuf.WriteString("\n"); err != nil {
+			return nil, fmt.Errorf("%s: %w", errMsg, err)
 		}
 		line++
 	}
@@ -142,12 +134,121 @@ func SetValuesInBytes(inBytes []byte, updates []Update) ([]byte, error) {
 	return outBuf.Bytes(), nil
 }
 
-func findScalarNode(node *yaml.Node, keyPath []string) (int, int, error) {
+// replaceScalar returns a copy of the provided line with the scalar that the
+// provided node says begins on it replaced by the provided value. Anything
+// following the scalar on the same line, such as a comment or the remaining
+// entries of a flow collection, is preserved.
+func replaceScalar(line string, node *yaml.Node, value any) string {
+	// Node columns count characters, not bytes.
+	start := byteOffset(line, node.Column-1)
+	unchanged := line[:start]
+	if !strings.HasSuffix(unchanged, " ") {
+		unchanged += " "
+	}
+	length, ok := scalarLength(line[start:], node)
+	if !ok {
+		// The end of the scalar is not on this line, so replace everything from
+		// the start of the scalar to the end of the line.
+		return unchanged + fmt.Sprint(QuoteIfNecessary(value))
+	}
+	return unchanged +
+		fmt.Sprint(formatValue(value, node.Style)) +
+		line[start+length:]
+}
+
+// byteOffset returns the byte offset of the character at the provided index in
+// the provided string, or the string's length if the index is out of range.
+func byteOffset(s string, charIndex int) int {
+	var i int
+	for offset := range s {
+		if i == charIndex {
+			return offset
+		}
+		i++
+	}
+	return len(s)
+}
+
+// scalarLength returns the length in bytes of the scalar that the provided
+// node describes and that the provided string begins with. It returns false if
+// the end of the scalar cannot be found in the provided string, as with an
+// empty scalar, a scalar that spans multiple lines, or a scalar preceded by an
+// anchor or tag.
+func scalarLength(s string, node *yaml.Node) (int, bool) {
+	switch node.Style {
+	case 0: // Plain
+		// A plain scalar on a single line is written exactly as its value.
+		if node.Value != "" && strings.HasPrefix(s, node.Value) {
+			return len(node.Value), true
+		}
+	case yaml.DoubleQuotedStyle:
+		return doubleQuotedLength(s)
+	case yaml.SingleQuotedStyle:
+		return singleQuotedLength(s)
+	}
+	return 0, false
+}
+
+// doubleQuotedLength returns the length in bytes, including quotes, of the
+// double-quoted string that the provided string begins with. It returns false
+// if the provided string does not begin with a closed double-quoted string.
+func doubleQuotedLength(s string) (int, bool) {
+	if !strings.HasPrefix(s, `"`) {
+		return 0, false
+	}
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++ // Skip the escaped character
+		case '"':
+			return i + 1, true
+		}
+	}
+	return 0, false
+}
+
+// singleQuotedLength returns the length in bytes, including quotes, of the
+// single-quoted string that the provided string begins with. It returns false
+// if the provided string does not begin with a closed single-quoted string.
+func singleQuotedLength(s string) (int, bool) {
+	if !strings.HasPrefix(s, "'") {
+		return 0, false
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] != '\'' {
+			continue
+		}
+		// Two consecutive single quotes are an escaped single quote.
+		if i+1 < len(s) && s[i+1] == '\'' {
+			i++
+			continue
+		}
+		return i + 1, true
+	}
+	return 0, false
+}
+
+// formatValue returns the provided value formatted for writing in place of a
+// scalar of the provided style. A string replacing a quoted string is quoted
+// in the same way. Any other value is quoted only if necessary.
+func formatValue(value any, style yaml.Style) any {
+	if str, ok := value.(string); ok {
+		switch style {
+		case yaml.DoubleQuotedStyle:
+			return strconv.Quote(str)
+		case yaml.SingleQuotedStyle:
+			return "'" + strings.ReplaceAll(str, "'", "''") + "'"
+		}
+	}
+	return QuoteIfNecessary(value)
+}
+
+func findScalarNode(node *yaml.Node, keyPath []string) (*yaml.Node, error) {
 	if len(keyPath) == 0 {
 		if node.Kind == yaml.ScalarNode {
-			return node.Line - 1, node.Column - 1, nil
+			return node, nil
 		}
-		return 0, 0, fmt.Errorf("key path does not address a scalar node")
+		return nil, fmt.Errorf("key path does not address a scalar node")
 	}
 	switch node.Kind {
 	case yaml.DocumentNode:
@@ -161,9 +262,9 @@ func findScalarNode(node *yaml.Node, keyPath []string) (int, int, error) {
 	case yaml.SequenceNode:
 		index, err := strconv.Atoi(keyPath[0])
 		if err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 		return findScalarNode(node.Content[index], keyPath[1:])
 	}
-	return 0, 0, fmt.Errorf("key path not found")
+	return nil, fmt.Errorf("key path not found")
 }
